@@ -1,0 +1,20 @@
+[Unit]
+Description=Private File Transfer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=newapp
+Group=newapp
+WorkingDirectory=/opt/private-transfer
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/private-transfer/config.env
+ExecStart=/opt/private-transfer/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 9100 --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
