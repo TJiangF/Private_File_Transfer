@@ -1,0 +1,68 @@
+#!/bin/zsh
+set -u
+
+SERVICE="transfer.tfworks.cn"
+ACCOUNT="admin@tfworks.cn"
+API="https://transfer.tfworks.cn/api/upload"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  print -r -- "usage: transfer-upload [--long-term] [--set-token] FILE..."
+  exit 0
+fi
+
+if [[ "${1:-}" == "--set-token" ]]; then
+  shift
+  if (( $# > 0 )); then
+    TOKEN="$1"
+  else
+    TOKEN=""
+    read -rs TOKEN
+  fi
+  if [[ -z "$TOKEN" ]]; then
+    print -r -- "missing token" >&2
+    exit 1
+  fi
+  security add-generic-password -U -a "$ACCOUNT" -s "$SERVICE" -w "$TOKEN" >/dev/null
+  print -r -- "token saved in Keychain"
+  exit 0
+fi
+
+PERM=0
+if [[ "${1:-}" == "--long-term" ]]; then
+  PERM=1
+  shift
+fi
+
+TOKEN="$(security find-generic-password -a "$ACCOUNT" -s "$SERVICE" -w 2>/dev/null || true)"
+if [[ -z "$TOKEN" ]]; then
+  osascript -e 'display alert "Transfer" message "No API token found. Run transfer-upload --set-token first."' >/dev/null 2>&1 || true
+  print -r -- "missing API token; run transfer-upload --set-token" >&2
+  exit 1
+fi
+
+args=()
+n=0
+for f in "$@"; do
+  if [[ ! -f "$f" ]]; then
+    continue
+  fi
+  args+=( -F "files=@$f" )
+  (( n += 1 ))
+done
+
+if (( n == 0 )); then
+  osascript -e 'display alert "Transfer" message "No regular files selected."' >/dev/null 2>&1 || true
+  print -r -- "no regular files" >&2
+  exit 1
+fi
+
+OUT="$(mktemp /tmp/transfer-upload.XXXXXX)"
+if ! curl -fsS -H "Authorization: Bearer $TOKEN" -F "permanent=$PERM" "${args[@]}" "$API" >"$OUT"; then
+  rm -f "$OUT"
+  osascript -e 'display alert "Transfer" message "Upload failed."' >/dev/null 2>&1 || true
+  print -r -- "upload failed" >&2
+  exit 1
+fi
+rm -f "$OUT"
+osascript -e "display notification \"已上传 $n 个文件\" with title \"Transfer\"" >/dev/null 2>&1 || true
+print -r -- "uploaded $n file(s)"

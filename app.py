@@ -14,13 +14,14 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.middleware.sessions import SessionMiddleware
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("TRANSFER_DATA_DIR", os.path.join(APP_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
 META_FILE = os.path.join(DATA_DIR, "files.json")
+TOKENS_FILE = os.path.join(DATA_DIR, "api_tokens.json")
 USERS_FILE = os.environ.get("TRANSFER_USERS_FILE", "/opt/ssb-monitor/data/users.json")
 RETENTION_DAYS = float(os.environ.get("TRANSFER_RETENTION_DAYS", "3"))
 CLEAN_INTERVAL = int(os.environ.get("TRANSFER_CLEAN_INTERVAL", "300"))
@@ -59,6 +60,7 @@ app.add_middleware(
 )
 
 _META_LOCK = threading.RLock()
+_TOKEN_LOCK = threading.RLock()
 _LOGIN_LOCK = threading.RLock()
 _LOGIN_FAILS = {}
 _LOGIN_BLOCK_UNTIL = {}
@@ -78,8 +80,11 @@ label.check { display: inline-flex; align-items: center; gap: 6px; font-size: 14
 button { border: 0; border-radius: 9px; padding: 9px 16px; background: #2563eb; color: #fff; cursor: pointer; font-size: 14px; }
 button.gray { background: #eef2f7; color: #334155; }
 button.red { background: #fee2e2; color: #b91c1c; }
+button.small { padding: 6px 10px; font-size: 12px; }
 .notice { background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; padding: 10px 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
 .err { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; padding: 10px 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+.token { display: block; background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; font-size: 13px; margin: 10px 0; }
+.inline { display: inline; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { padding: 10px 8px; border-bottom: 1px solid #eef2f7; text-align: left; vertical-align: middle; }
 th { color: #64748b; font-weight: 600; background: #f8fafc; }
@@ -200,6 +205,58 @@ def _write_meta_unlocked(files):
     with open(tmp, "w") as f:
         json.dump({"files": files}, f, ensure_ascii=False, indent=1)
     os.replace(tmp, META_FILE)
+
+
+def _token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _read_tokens_unlocked():
+    try:
+        with open(TOKENS_FILE, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("tokens"), list):
+            return [str(x) for x in data["tokens"]]
+    except Exception:
+        pass
+    return []
+
+
+def _write_tokens_unlocked(tokens):
+    tmp = TOKENS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"tokens": tokens}, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, TOKENS_FILE)
+
+
+def _api_token_valid(token):
+    if not token:
+        return False
+    digest = _token_hash(token)
+    with _TOKEN_LOCK:
+        return any(hmac.compare_digest(digest, x) for x in _read_tokens_unlocked())
+
+
+def _create_api_token():
+    token = secrets.token_urlsafe(36)
+    digest = _token_hash(token)
+    with _TOKEN_LOCK:
+        tokens = _read_tokens_unlocked()
+        tokens.append(digest)
+        _write_tokens_unlocked(tokens)
+    return token
+
+
+def _revoke_api_tokens():
+    with _TOKEN_LOCK:
+        _write_tokens_unlocked([])
+
+
+def _api_token_from_request(request):
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return request.headers.get("x-transfer-token", "").strip()
 
 
 def _safe_name(name):
@@ -372,8 +429,25 @@ def _redirect_msg(msg):
     return RedirectResponse("/?msg=" + quote(msg), status_code=303)
 
 
+def _token_page(token):
+    return HTMLResponse(f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Private File Transfer · 新令牌</title>
+<style>{BASE_CSS}</style></head><body>
+<div class="wrap login"><div class="card">
+<h1>新 API 令牌</h1>
+<div class="sub">只显示这一次，请立即保存到 macOS Keychain。</div>
+<code class="token">{esc(token)}</code>
+<div class="muted">保存命令：<br>~/bin/transfer-upload --set-token &lt;TOKEN&gt;</div>
+<p><a href="/">返回文件列表</a></p>
+</div></div></body></html>""")
+
+
 def _page(user, files, msg=""):
     notice = f'<div class="notice">{esc(msg)}</div>' if msg else ""
+    with _TOKEN_LOCK:
+        token_count = len(_read_tokens_unlocked())
     return HTMLResponse(f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -394,6 +468,14 @@ def _page(user, files, msg=""):
 <div class="muted" style="margin-top:8px">未勾选长期有效的文件保留 3 天；到期后自动删除。</div>
 </div>
 <div class="card">
+<h2>macOS Quick Action 令牌</h2>
+<div class="muted" style="margin-bottom:10px">当前有效令牌：{token_count} 个。生成后只显示一次，请存入 macOS Keychain，不要存密码。</div>
+<div class="actions">
+<form method="post" action="/api/token/create"><button type="submit" class="small">生成新令牌</button></form>
+<form method="post" action="/api/token/revoke"><button type="submit" class="small red">吊销全部令牌</button></form>
+</div>
+</div>
+<div class="card">
 <h2>云端文件（{len(files)}）</h2>
 <div style="overflow-x:auto"><table>
 <thead><tr><th>文件</th><th>上传时间</th><th>有效期</th><th>状态</th><th>操作</th></tr></thead>
@@ -401,6 +483,49 @@ def _page(user, files, msg=""):
 </div>
 <div class="muted">非长期文件保留 3 天；系统每 5 分钟自动清理一次。</div>
 </div></body></html>""")
+
+
+def _save_uploads(request, files, permanent, source):
+    cleanup_expired()
+    if not files:
+        return 0, []
+    created = []
+    with _META_LOCK:
+        meta = _read_meta_unlocked()
+        for item in files:
+            name = _safe_name(item.filename)
+            fid = uuid.uuid4().hex
+            blob = fid + _safe_ext(name)
+            path = os.path.join(FILES_DIR, blob)
+            try:
+                with open(path, "wb") as out:
+                    shutil.copyfileobj(item.file, out)
+                size = os.path.getsize(path)
+            except Exception:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception:
+                    pass
+                continue
+            now = _now()
+            perm = permanent == "1"
+            rec = {
+                "id": fid,
+                "name": name,
+                "blob": blob,
+                "size": size,
+                "content_type": item.content_type or mimetypes.guess_type(name)[0] or "application/octet-stream",
+                "uploaded_at": _iso(now),
+                "permanent": perm,
+                "expires_at": None if perm else _iso(now + timedelta(days=RETENTION_DAYS)),
+                "uploader_ip": _client_ip(request),
+                "source": source,
+            }
+            meta.append(rec)
+            created.append({"id": fid, "name": name, "size": size, "permanent": perm})
+        _write_meta_unlocked(meta)
+    return len(created), created
 
 
 @app.get("/healthz")
@@ -450,50 +575,55 @@ def logout_get(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
+@app.get("/token", response_class=HTMLResponse)
+def token_page(request: Request):
+    if not _current_user(request):
+        return RedirectResponse("/login", status_code=303)
+    token = request.session.pop("new_token", None)
+    if not token:
+        return RedirectResponse("/", status_code=303)
+    return _token_page(token)
+
+
+@app.post("/api/token/create")
+def api_token_create(request: Request):
+    if not _current_user(request):
+        return RedirectResponse("/login", status_code=303)
+    token = _create_api_token()
+    request.session["new_token"] = token
+    return RedirectResponse("/token", status_code=303)
+
+
+@app.post("/api/token/revoke")
+def api_token_revoke(request: Request):
+    if not _current_user(request):
+        return RedirectResponse("/login", status_code=303)
+    _revoke_api_tokens()
+    return _redirect_msg("已吊销全部 API 令牌")
+
+
+@app.post("/api/upload")
+def api_upload(request: Request, files: list[UploadFile] = File(...), permanent: str = Form("")):
+    token = _api_token_from_request(request)
+    if not _api_token_valid(token):
+        return JSONResponse({"ok": False, "msg": "unauthorized"}, status_code=401)
+    if not files:
+        return JSONResponse({"ok": False, "msg": "no files"}, status_code=400)
+    count, created = _save_uploads(request, files, permanent, "api")
+    if not count:
+        return JSONResponse({"ok": False, "msg": "upload failed"}, status_code=500)
+    return JSONResponse({"ok": True, "created": count, "files": created})
+
+
 @app.post("/upload")
 def upload(request: Request, files: list[UploadFile] = File(...), permanent: str = Form("")):
     if not _current_user(request):
         return RedirectResponse("/login", status_code=303)
-    cleanup_expired()
     if not files:
         return _redirect_msg("请选择文件")
-    created = 0
-    with _META_LOCK:
-        meta = _read_meta_unlocked()
-        for item in files:
-            name = _safe_name(item.filename)
-            fid = uuid.uuid4().hex
-            blob = fid + _safe_ext(name)
-            path = os.path.join(FILES_DIR, blob)
-            try:
-                with open(path, "wb") as out:
-                    shutil.copyfileobj(item.file, out)
-                size = os.path.getsize(path)
-            except Exception:
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except Exception:
-                    pass
-                continue
-            now = _now()
-            perm = permanent == "1"
-            rec = {
-                "id": fid,
-                "name": name,
-                "blob": blob,
-                "size": size,
-                "content_type": item.content_type or mimetypes.guess_type(name)[0] or "application/octet-stream",
-                "uploaded_at": _iso(now),
-                "permanent": perm,
-                "expires_at": None if perm else _iso(now + timedelta(days=RETENTION_DAYS)),
-                "uploader_ip": _client_ip(request),
-            }
-            meta.append(rec)
-            created += 1
-        _write_meta_unlocked(meta)
-    if created:
-        return _redirect_msg(f"已上传 {created} 个文件")
+    count, _ = _save_uploads(request, files, permanent, "web")
+    if count:
+        return _redirect_msg(f"已上传 {count} 个文件")
     return _redirect_msg("上传失败")
 
 
